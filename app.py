@@ -104,7 +104,7 @@ NEWS_CATEGORIES = [
             {
                 "endpoint": "everything",
                 "params": {
-                    "q":        "Eurozone OR ECB OR "von der Leyen" OR "Brussels" OR NATO Europe",
+                    "q":        'Eurozone OR ECB OR "von der Leyen" OR "Brussels" OR NATO Europe',
                     "language": "en",
                     "sortBy":   "relevancy",
                     "pageSize": 10,
@@ -211,7 +211,7 @@ NEWS_CATEGORIES = [
             {
                 "endpoint": "everything",
                 "params": {
-                    "q":        "Taiwan OR semiconductor Asia OR 'Indo-Pacific' OR BRICS Asia",
+                    "q":        'Taiwan OR "semiconductor" OR "Indo-Pacific" OR "BRICS Asia"',
                     "language": "en",
                     "sortBy":   "relevancy",
                     "pageSize": 8,
