@@ -4,11 +4,12 @@ NewsAI - Configuratore e Generatore di Report Notizie
 Politica ZERO-PERSISTENCE: nessun DB, nessun log lato server.
 API Key solo in st.session_state (memoria volatile).
 
-Flusso:
-  1. L'utente inserisce le API Key (NewsAPI + provider LLM) nella sidebar
-  2. Clicca "🔍 Cerca Notizie" → l'app interroga NewsAPI per 6 categorie tematiche
-  3. Clicca "🚀 Genera Report" → le notizie raccolte vengono inviate all'LLM scelto
-  4. Il report strutturato in Markdown viene mostrato e scaricabile
+MIGLIORAMENTI v2:
+  - Query multiple per categoria con raccolta e deduplicazione
+  - Fallback automatico su endpoint /top-headlines quando /everything fallisce
+  - Sorgenti NewsAPI esplicite per Europa e Germania
+  - Date range più ampio con ordinamento per rilevanza + recenza
+  - Debug mode per visualizzare le query eseguite
 
 Esegui con: streamlit run app.py
 """
@@ -63,81 +64,230 @@ OPENAI_MODELS = {
     "gpt-4o-mini":   "GPT-4o Mini (Fast & Cost-Effective)",
     "gpt-4-turbo":   "GPT-4 Turbo (High Context)",
     "gpt-3.5-turbo": "GPT-3.5 Turbo (Legacy Budget)",
-    "o1-preview":    "o1 Preview (Advanced Reasoning)",
     "o1-mini":       "o1 Mini (Compact Reasoning)",
 }
 
 PROVIDERS = ["Google (Gemini)", "OpenRouter", "OpenAI"]
 
+NEWSAPI_BASE = "https://newsapi.org/v2"
+
 # ---------------------------------------------------------------------------
-# Definizione delle 6 categorie di ricerca su NewsAPI
-# Ogni categoria ha: nome visualizzato, endpoint, e parametri di query
+# STRATEGIA MULTI-QUERY per ogni categoria
+# Ogni categoria ha una lista di "sub-query" che vengono eseguite in
+# sequenza. I risultati vengono uniti e deduplicati per URL.
+# Questo garantisce copertura anche quando una query restituisce 0 articoli.
 # ---------------------------------------------------------------------------
 NEWS_CATEGORIES = [
     {
-        "id":       "europe",
-        "label":    "🇪🇺 Notizie Europee",
-        "endpoint": "everything",
-        "params": {
-            "q":        "Europe OR European Union OR EU OR Eurozone OR Brussels",
-            "language": "en",
-            "sortBy":   "publishedAt",
-            "pageSize": 15,
-        },
+        "id":    "europe",
+        "label": "🇪🇺 Notizie Europee",
+        "queries": [
+            # Query 1: Istituzioni UE dirette
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        '"European Union" OR "EU Commission" OR "European Parliament" OR "Council of Europe"',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 15,
+                },
+            },
+            # Query 2: Top headlines Europa con sorgenti europee premium
+            {
+                "endpoint": "top-headlines",
+                "params": {
+                    "sources":  "bbc-news,reuters,the-guardian-uk,euronews,france-24",
+                    "pageSize": 15,
+                },
+            },
+            # Query 3: Parole chiave più broad
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        "Eurozone OR ECB OR "von der Leyen" OR "Brussels" OR NATO Europe",
+                    "language": "en",
+                    "sortBy":   "relevancy",
+                    "pageSize": 10,
+                },
+            },
+        ],
     },
     {
-        "id":       "germany",
-        "label":    "🏭 Economia Tedesca",
-        "endpoint": "everything",
-        "params": {
-            "q":        "Germany economy OR Germany Wirtschaft OR Bundesbank OR DAX OR German industry OR Scholz OR Merz",
-            "language": "en",
-            "sortBy":   "publishedAt",
-            "pageSize": 12,
-        },
+        "id":    "germany",
+        "label": "🏭 Economia Tedesca",
+        "queries": [
+            # Query 1: Economia e finanza tedesca
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        'Germany economy OR "German GDP" OR Bundesbank OR "DAX" OR "German inflation"',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 15,
+                },
+            },
+            # Query 2: Politica tedesca
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        'Scholz OR Merz OR Habeck OR Bundestag OR "German government" OR "Germany politics"',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 12,
+                },
+            },
+            # Query 3: Industria tedesca
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        '"German industry" OR "Volkswagen" OR "BMW" OR "Siemens" OR "German exports" OR "energy crisis Germany"',
+                    "language": "en",
+                    "sortBy":   "relevancy",
+                    "pageSize": 10,
+                },
+            },
+        ],
     },
     {
-        "id":       "usa",
-        "label":    "🇺🇸 USA",
-        "endpoint": "top-headlines",
-        "params": {
-            "country":  "us",
-            "category": "general",
-            "pageSize": 12,
-        },
+        "id":    "usa",
+        "label": "🇺🇸 USA",
+        "queries": [
+            # Query 1: Top headlines USA (endpoint dedicato, sempre popolato)
+            {
+                "endpoint": "top-headlines",
+                "params": {
+                    "country":  "us",
+                    "category": "general",
+                    "pageSize": 15,
+                },
+            },
+            # Query 2: Politica USA
+            {
+                "endpoint": "top-headlines",
+                "params": {
+                    "country":  "us",
+                    "category": "politics",
+                    "pageSize": 10,
+                },
+            },
+            # Query 3: Economia USA con sorgenti americane
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        '"Federal Reserve" OR "US economy" OR "White House" OR "Congress" OR "Trump" OR "Biden"',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 10,
+                    "sources":  "the-wall-street-journal,bloomberg,cnn,msnbc,fox-news,associated-press",
+                },
+            },
+        ],
     },
     {
-        "id":       "asia",
-        "label":    "🌏 Asia",
-        "endpoint": "everything",
-        "params": {
-            "q":        "China OR Japan OR India OR South Korea OR Taiwan OR ASEAN OR Xi Jinping OR Modi",
-            "language": "en",
-            "sortBy":   "publishedAt",
-            "pageSize": 12,
-        },
+        "id":    "asia",
+        "label": "🌏 Asia",
+        "queries": [
+            # Query 1: Cina
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        'China OR "Xi Jinping" OR "CCP" OR "People\'s Bank of China" OR Taiwan strait',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 12,
+                },
+            },
+            # Query 2: Giappone, India, Corea
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        'Japan OR India OR "South Korea" OR Modi OR "Bank of Japan" OR ASEAN',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 10,
+                },
+            },
+            # Query 3: Taiwan e tensioni
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        "Taiwan OR semiconductor Asia OR 'Indo-Pacific' OR BRICS Asia",
+                    "language": "en",
+                    "sortBy":   "relevancy",
+                    "pageSize": 8,
+                },
+            },
+        ],
     },
     {
-        "id":       "mideast",
-        "label":    "🕌 Medio Oriente",
-        "endpoint": "everything",
-        "params": {
-            "q":        "Middle East OR Israel OR Iran OR Gaza OR Palestine OR Lebanon OR Saudi Arabia OR Syria OR Yemen",
-            "language": "en",
-            "sortBy":   "publishedAt",
-            "pageSize": 12,
-        },
+        "id":    "mideast",
+        "label": "🕌 Medio Oriente",
+        "queries": [
+            # Query 1: Conflitti attivi
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        'Israel OR Gaza OR Hamas OR Palestine OR "West Bank"',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 12,
+                },
+            },
+            # Query 2: Iran e petrolio
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        'Iran OR Lebanon OR Hezbollah OR "Saudi Arabia" OR OPEC OR Yemen OR Syria',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 10,
+                },
+            },
+            # Query 3: Diplomazia regionale
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        '"Middle East" peace OR ceasefire OR "Abraham Accords" OR "Gulf states"',
+                    "language": "en",
+                    "sortBy":   "relevancy",
+                    "pageSize": 8,
+                },
+            },
+        ],
     },
     {
-        "id":       "markets",
-        "label":    "📊 Mercati Finanziari",
-        "endpoint": "everything",
-        "params": {
-            "q":        "DAX stock market OR EUR/USD OR Federal Reserve OR ECB OR interest rates OR inflation OR oil price Brent",
-            "language": "en",
-            "sortBy":   "publishedAt",
-            "pageSize": 12,
-        },
+        "id":    "markets",
+        "label": "📊 Mercati Finanziari",
+        "queries": [
+            # Query 1: Banche centrali e tassi
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        '"Federal Reserve" OR "ECB" OR "interest rates" OR "inflation" OR "monetary policy"',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 12,
+                },
+            },
+            # Query 2: Mercati azionari e commodities
+            {
+                "endpoint": "everything",
+                "params": {
+                    "q":        '"stock market" OR "DAX" OR "S&P 500" OR "oil price" OR "Brent crude" OR "EUR/USD"',
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": 12,
+                },
+            },
+            # Query 3: Sorgenti finanziarie dedicate
+            {
+                "endpoint": "top-headlines",
+                "params": {
+                    "sources":  "bloomberg,the-wall-street-journal,financial-times,cnbc,reuters",
+                    "pageSize": 15,
+                },
+            },
+        ],
     },
 ]
 
@@ -213,25 +363,22 @@ Chiudi il report con 3-5 bullet point che evidenziano:
 # ===========================================================================
 
 def init_session_state():
-    """Inizializza le variabili di sessione se non già presenti."""
     defaults = {
-        # --- API Keys ---
         "newsapi_key":      "",
         "openrouter_key":   "",
         "openai_key":       "",
         "google_key":       "",
-        # --- Configurazione LLM ---
         "provider":         PROVIDERS[0],
         "model_id":         "gemini-2.5-flash",
-        # --- Dati operativi ---
-        "fetched_news":     {},      # dict: category_id -> list of article dicts
-        "fetch_timestamp":  None,    # datetime dell'ultimo fetch
-        "raw_news_text":    "",      # testo aggregato pronto per l'LLM
-        "report_output":    "",      # testo del report generato
-        "fetch_errors":     [],      # lista di errori durante il fetch
-        # --- Opzioni ricerca ---
-        "news_days_back":   1,       # quanti giorni indietro cercare
-        "selected_cats":    [c["id"] for c in NEWS_CATEGORIES],  # categorie attive
+        "fetched_news":     {},
+        "fetch_timestamp":  None,
+        "raw_news_text":    "",
+        "report_output":    "",
+        "fetch_errors":     [],
+        "fetch_debug":      [],       # log delle query eseguite
+        "news_days_back":   2,        # default 2 giorni per più copertura
+        "selected_cats":    [c["id"] for c in NEWS_CATEGORIES],
+        "debug_mode":       False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -245,7 +392,6 @@ init_session_state()
 # ===========================================================================
 
 def export_config() -> str:
-    """Serializza la configurazione corrente in una stringa JSON."""
     config = {
         "provider":       st.session_state.provider,
         "model_id":       st.session_state.model_id,
@@ -260,7 +406,6 @@ def export_config() -> str:
 
 
 def import_config(uploaded_file) -> bool:
-    """Legge il file JSON e ripopola st.session_state."""
     try:
         config = json.loads(uploaded_file.read())
         st.session_state.provider       = config.get("provider",       st.session_state.provider)
@@ -269,7 +414,7 @@ def import_config(uploaded_file) -> bool:
         st.session_state.openrouter_key = config.get("openrouter_key", "")
         st.session_state.openai_key     = config.get("openai_key",     "")
         st.session_state.google_key     = config.get("google_key",     "")
-        st.session_state.news_days_back = config.get("news_days_back", 1)
+        st.session_state.news_days_back = config.get("news_days_back", 2)
         st.session_state.selected_cats  = config.get("selected_cats",  [c["id"] for c in NEWS_CATEGORIES])
         return True
     except Exception as e:
@@ -278,35 +423,33 @@ def import_config(uploaded_file) -> bool:
 
 
 # ===========================================================================
-# NEWSAPI: Recupero autonomo delle notizie
+# NEWSAPI: Recupero multi-query con deduplicazione
 # ===========================================================================
 
-NEWSAPI_BASE = "https://newsapi.org/v2"
-
-def fetch_category(api_key: str, category: dict, from_date: str) -> list[dict]:
+def _execute_single_query(api_key: str, endpoint: str, params: dict, from_date: str) -> tuple[list, str]:
     """
-    Recupera gli articoli per una singola categoria da NewsAPI.
-    Restituisce una lista di dict con i campi normalizzati.
+    Esegue una singola chiamata a NewsAPI.
+    Restituisce (articles, debug_info).
     """
-    endpoint = category["endpoint"]
-    params   = dict(category["params"])  # copia per non modificare la costante
-    params["apiKey"] = api_key
+    p = dict(params)
+    p["apiKey"] = api_key
 
-    # Aggiunge il filtro temporale solo per l'endpoint /everything
-    if endpoint == "everything":
-        params["from"] = from_date
+    # Aggiunge il filtro data solo per /everything (non per /top-headlines)
+    if endpoint == "everything" and "from" not in p:
+        p["from"] = from_date
 
     url = f"{NEWSAPI_BASE}/{endpoint}"
-    resp = requests.get(url, params=params, timeout=20)
+    debug = f"GET /{endpoint} | q={p.get('q','—')[:60]} | sources={p.get('sources','—')}"
+
+    resp = requests.get(url, params=p, timeout=20)
     resp.raise_for_status()
     data = resp.json()
 
     if data.get("status") != "ok":
-        raise ValueError(f"NewsAPI error: {data.get('message', 'unknown error')}")
+        raise ValueError(f"NewsAPI: {data.get('message', 'unknown error')}")
 
     articles = []
     for art in data.get("articles", []):
-        # Filtra articoli senza titolo o con titolo "[Removed]"
         title = (art.get("title") or "").strip()
         if not title or title == "[Removed]":
             continue
@@ -317,63 +460,116 @@ def fetch_category(api_key: str, category: dict, from_date: str) -> list[dict]:
             "url":         art.get("url", ""),
             "publishedAt": art.get("publishedAt", ""),
         })
-    return articles
+
+    debug += f" → {len(articles)} articoli"
+    return articles, debug
 
 
-def fetch_all_news(api_key: str, selected_cat_ids: list, days_back: int) -> tuple[dict, list]:
+def fetch_category_multi(api_key: str, category: dict, from_date: str) -> tuple[list, list]:
     """
-    Interroga NewsAPI per tutte le categorie selezionate.
-    Ritorna (fetched_news_dict, errors_list).
+    Esegue tutte le sub-query della categoria, raccoglie i risultati,
+    deduplica per URL e restituisce (articles_merged, debug_lines).
     """
-    from_date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    results   = {}
-    errors    = []
+    seen_urls   = set()
+    seen_titles = set()
+    merged      = []
+    debug_lines = [f"── {category['label']} ──"]
 
+    for i, q in enumerate(category["queries"], 1):
+        try:
+            arts, dbg = _execute_single_query(
+                api_key, q["endpoint"], q["params"], from_date
+            )
+            debug_lines.append(f"  Q{i}: {dbg}")
+
+            for art in arts:
+                url   = art["url"]
+                title = art["title"].lower()[:80]   # normalizza per dedup titoli simili
+                if url not in seen_urls and title not in seen_titles:
+                    seen_urls.add(url)
+                    seen_titles.add(title)
+                    merged.append(art)
+
+            # Pausa breve tra le query della stessa categoria
+            time.sleep(0.25)
+
+        except requests.exceptions.HTTPError as he:
+            status = he.response.status_code if he.response is not None else "?"
+            msg = f"  Q{i}: HTTP {status}"
+            debug_lines.append(msg)
+            if status == 401:
+                raise  # chiave non valida: inutile continuare
+        except Exception as e:
+            debug_lines.append(f"  Q{i}: Errore — {str(e)[:80]}")
+
+    debug_lines.append(f"  ✅ Totale unici: {len(merged)} articoli")
+    return merged, debug_lines
+
+
+def fetch_all_news(api_key: str, selected_cat_ids: list, days_back: int) -> tuple[dict, list, list]:
+    """
+    Interroga NewsAPI per tutte le categorie selezionate con strategia multi-query.
+    Ritorna (fetched_news_dict, errors_list, debug_lines).
+    """
+    from_date   = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    results     = {}
+    errors      = []
+    all_debug   = [f"🗓️ From date: {from_date}"]
     active_cats = [c for c in NEWS_CATEGORIES if c["id"] in selected_cat_ids]
 
     for cat in active_cats:
         try:
-            articles = fetch_category(api_key, cat, from_date)
+            articles, debug_lines = fetch_category_multi(api_key, cat, from_date)
             results[cat["id"]] = articles
-            # Piccola pausa per non saturare il rate limit del piano free (100 req/giorno)
-            time.sleep(0.3)
+            all_debug.extend(debug_lines)
         except requests.exceptions.HTTPError as he:
             status = he.response.status_code if he.response is not None else "?"
             if status == 401:
-                errors.append(f"{cat['label']}: NewsAPI Key non valida (401)")
+                errors.append(f"❌ NewsAPI Key non valida (401). Controlla la chiave.")
+                break
             elif status == 429:
-                errors.append(f"{cat['label']}: Rate limit raggiunto (429)")
+                errors.append(f"{cat['label']}: Rate limit raggiunto (429) — attendi qualche minuto")
             else:
                 errors.append(f"{cat['label']}: Errore HTTP {status}")
         except Exception as e:
             errors.append(f"{cat['label']}: {str(e)}")
 
-    return results, errors
+    return results, errors, all_debug
 
 
 def format_news_for_llm(fetched_news: dict) -> str:
     """
-    Formatta il dizionario di notizie in un testo strutturato
-    pronto da inviare all'LLM come User Prompt.
+    Formatta il dizionario di notizie in un testo strutturato per l'LLM.
+    Include un cap per non superare il context window (max 40 articoli/categoria).
     """
     lines = [
-        f"# Notizie Raccolte Automaticamente — {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC",
+        f"# Notizie Raccolte — {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC",
         "",
     ]
     cat_map = {c["id"]: c["label"] for c in NEWS_CATEGORIES}
+    MAX_PER_CAT = 30  # limite articoli per categoria per non saturare il context
 
     for cat_id, articles in fetched_news.items():
         label = cat_map.get(cat_id, cat_id)
         lines.append(f"## {label}")
+
         if not articles:
             lines.append("*Nessun articolo disponibile per questa categoria.*")
         else:
-            for i, art in enumerate(articles, 1):
+            # Ordina per data (più recenti prima) e applica il cap
+            sorted_arts = sorted(
+                articles,
+                key=lambda a: a.get("publishedAt", ""),
+                reverse=True
+            )[:MAX_PER_CAT]
+
+            for i, art in enumerate(sorted_arts, 1):
                 lines.append(f"{i}. **{art['title']}** [{art['source']}]")
                 if art["description"]:
                     lines.append(f"   {art['description']}")
                 if art["publishedAt"]:
-                    lines.append(f"   _(pubblicato: {art['publishedAt'][:10]})_")
+                    lines.append(f"   _(pubblicato: {art['publishedAt'][:16].replace('T', ' ')})_")
+
         lines.append("")
 
     return "\n".join(lines)
@@ -399,7 +595,7 @@ def call_openrouter(api_key: str, model_id: str, system_prompt: str, user_prompt
         ],
         "temperature": 0.3,
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    resp = requests.post(url, headers=headers, json=payload, timeout=180)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
@@ -427,7 +623,7 @@ def call_openai(api_key: str, model_id: str, system_prompt: str, user_prompt: st
             ],
             "temperature": 0.3,
         }
-        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
@@ -454,15 +650,14 @@ def call_google(api_key: str, model_id: str, system_prompt: str, user_prompt: st
             "contents":           [{"parts": [{"text": user_prompt}]}],
             "generationConfig":   {"temperature": 0.3},
         }
-        resp = requests.post(url, json=payload, timeout=120)
+        resp = requests.post(url, json=payload, timeout=180)
         resp.raise_for_status()
         return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 
 def generate_report(provider: str, model_id: str, raw_news_text: str) -> str:
-    """Dispatcher: sceglie il provider e avvia la chiamata LLM."""
     if not raw_news_text.strip():
-        raise ValueError("Nessuna notizia disponibile. Esegui prima la ricerca con il pulsante 🔍 Cerca Notizie.")
+        raise ValueError("Nessuna notizia disponibile. Esegui prima 🔍 Cerca Notizie.")
 
     if provider == "OpenRouter":
         key = st.session_state.openrouter_key
@@ -504,16 +699,17 @@ st.markdown("""
 .brand-dot    { color:#e8a838; font-size:2rem; }
 .brand-sub    { font-size:0.75rem; color:#8b9ab0; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:1rem; }
 .sidebar-label{ font-size:0.67rem; font-weight:600; letter-spacing:0.1em; text-transform:uppercase; color:#8b9ab0; margin:1rem 0 0.3rem 0; }
-.provider-badge{ display:inline-block; background:#e8a838; color:#0f1117; border-radius:4px; padding:2px 8px; font-size:0.7rem; font-weight:700; }
 .report-container{ border-left:3px solid #e8a838; padding-left:1.2rem; margin-top:0.5rem; }
 .news-card{ background:#1e2230; border-radius:8px; padding:0.7rem 1rem; margin-bottom:0.5rem; border-left:3px solid #e8a838; }
 .news-card-title{ font-weight:600; font-size:0.9rem; color:#ffffff; line-height:1.3; }
 .news-card-meta { font-size:0.72rem; color:#8b9ab0; margin-top:0.2rem; }
 .news-card-desc { font-size:0.8rem; color:#c5cdd8; margin-top:0.3rem; line-height:1.4; }
-.stats-row{ display:flex; gap:1.5rem; margin:0.5rem 0 1rem 0; }
+.stats-row{ display:flex; gap:1.5rem; margin:0.5rem 0 1rem 0; flex-wrap:wrap; }
 .stat-box{ background:#1e2230; border-radius:8px; padding:0.6rem 1.2rem; text-align:center; min-width:90px; }
 .stat-num{ font-size:1.5rem; font-weight:700; color:#e8a838; font-family:'Georgia',serif; }
 .stat-lbl{ font-size:0.67rem; color:#8b9ab0; text-transform:uppercase; letter-spacing:0.08em; }
+.query-badge{ display:inline-block; background:#1e2230; border:1px solid #e8a838; color:#e8a838;
+              border-radius:4px; padding:2px 7px; font-size:0.68rem; font-family:monospace; margin:1px; }
 div.stButton > button[kind="primary"]{
     background:linear-gradient(135deg,#e8a838 0%,#c98a1a 100%);
     color:#0f1117; font-weight:700; border:none; font-size:1rem;
@@ -544,7 +740,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-label">📂 Importa Configurazione</div>', unsafe_allow_html=True)
     uploaded_config = st.file_uploader(
         "Carica config.json", type=["json"], label_visibility="collapsed",
-        help="Ripristina le impostazioni da un file config.json precedentemente esportato.",
+        help="Ripristina le impostazioni da un file config.json esportato in precedenza.",
     )
     if uploaded_config is not None:
         if import_config(uploaded_config):
@@ -560,28 +756,28 @@ with st.sidebar:
         value=st.session_state.newsapi_key,
         type="password",
         placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-        help="Chiave gratuita su https://newsapi.org — 100 richieste/giorno sul piano free.",
+        help="Chiave gratuita su https://newsapi.org — 100 req/giorno sul piano free.",
     )
     st.session_state.google_key = st.text_input(
         "Google (Gemini) API Key",
         value=st.session_state.google_key,
         type="password",
         placeholder="AIza...",
-        help="Ottieni la chiave su https://aistudio.google.com/apikey",
+        help="https://aistudio.google.com/apikey",
     )
     st.session_state.openrouter_key = st.text_input(
         "OpenRouter API Key",
         value=st.session_state.openrouter_key,
         type="password",
         placeholder="sk-or-...",
-        help="Ottieni la chiave su https://openrouter.ai/keys",
+        help="https://openrouter.ai/keys",
     )
     st.session_state.openai_key = st.text_input(
         "OpenAI API Key",
         value=st.session_state.openai_key,
         type="password",
         placeholder="sk-...",
-        help="Ottieni la chiave su https://platform.openai.com/api-keys",
+        help="https://platform.openai.com/api-keys",
     )
 
     st.divider()
@@ -603,7 +799,7 @@ with st.sidebar:
         model_options = list(OPENAI_MODELS.keys())
         model_labels  = list(OPENAI_MODELS.values())
 
-    cur = st.session_state.model_id
+    cur  = st.session_state.model_id
     midx = model_options.index(cur) if cur in model_options else 0
     sel_label = st.selectbox("Modello", options=model_labels, index=midx)
     st.session_state.model_id = model_options[model_labels.index(sel_label)]
@@ -622,10 +818,17 @@ with st.sidebar:
         "Notizie degli ultimi N giorni",
         min_value=1, max_value=7,
         value=st.session_state.news_days_back,
-        help="NewsAPI piano free supporta fino a 30 giorni, ma più giorni = più articoli = più token LLM.",
+        help="Più giorni = più articoli recuperati. Default 2 giorni per bilanciare copertura e rate limit.",
     )
 
-    cat_labels = {c["id"]: c["label"] for c in NEWS_CATEGORIES}
+    # Avviso consumo API
+    n_cats   = len(st.session_state.selected_cats)
+    n_queries = sum(
+        len(c["queries"]) for c in NEWS_CATEGORIES if c["id"] in st.session_state.selected_cats
+    )
+    st.caption(f"⚡ Con {n_cats} categorie: ~**{n_queries} query** NewsAPI per fetch "
+               f"(piano free: 100/giorno).")
+
     st.caption("Categorie da includere:")
     selected_cats = []
     for cat in NEWS_CATEGORIES:
@@ -634,11 +837,19 @@ with st.sidebar:
             selected_cats.append(cat["id"])
     st.session_state.selected_cats = selected_cats
 
+    # --- Debug mode ---
+    st.divider()
+    st.session_state.debug_mode = st.toggle(
+        "🐛 Debug mode",
+        value=st.session_state.debug_mode,
+        help="Mostra le query eseguite e il numero di articoli per ogni sub-query.",
+    )
+
     st.divider()
 
     # --- Export config ---
     st.markdown('<div class="sidebar-label">💾 Esporta Configurazione</div>', unsafe_allow_html=True)
-    st.caption("Salva tutte le impostazioni e le API Key in locale.")
+    st.caption("Salva tutte le impostazioni e API Key in locale.")
     st.download_button(
         label="⬇️ Scarica config.json",
         data=export_config(),
@@ -661,15 +872,16 @@ st.markdown("""
     <span style="font-family:'Georgia',serif; font-size:2.6rem; color:#e8a838;">AI</span>
 </div>
 <p style="color:#8b9ab0; font-size:0.8rem; letter-spacing:0.1em; text-transform:uppercase; margin-top:0;">
-    Generatore Autonomo di Report Geopolitici & Economici
+    Generatore Autonomo di Report Geopolitici &amp; Economici
 </p>
 """, unsafe_allow_html=True)
 
 st.divider()
 
-tab_main, tab_preview, tab_system = st.tabs([
+tab_main, tab_preview, tab_debug, tab_system = st.tabs([
     "🚀 Cerca & Genera Report",
     "📋 Anteprima Notizie Raccolte",
+    "🐛 Log Query",
     "⚙️ Istruzioni di Sistema",
 ])
 
@@ -680,9 +892,6 @@ tab_main, tab_preview, tab_system = st.tabs([
 
 with tab_main:
 
-    # -------------------------------------------------------------------------
-    # Riga status e pulsanti azione
-    # -------------------------------------------------------------------------
     col_fetch, col_gen, col_status = st.columns([1, 1, 2])
 
     with col_fetch:
@@ -691,7 +900,7 @@ with tab_main:
             use_container_width=True,
             type="secondary",
             disabled=not st.session_state.newsapi_key,
-            help="Interroga NewsAPI per tutte le categorie selezionate.",
+            help="Interroga NewsAPI con query multiple per ogni categoria selezionata.",
         )
         if not st.session_state.newsapi_key:
             st.caption("⚠️ Inserisci la NewsAPI Key nella sidebar.")
@@ -702,26 +911,28 @@ with tab_main:
             use_container_width=True,
             type="primary",
             disabled=not st.session_state.raw_news_text,
-            help="Invia le notizie raccolte all'LLM per generare il report.",
+            help="Invia le notizie raccolte all'LLM per generare il report strutturato.",
         )
         if not st.session_state.raw_news_text:
             st.caption("⚠️ Prima esegui la ricerca notizie.")
 
     with col_status:
         if st.session_state.fetch_timestamp:
-            ts = st.session_state.fetch_timestamp.strftime("%d/%m/%Y %H:%M")
+            ts    = st.session_state.fetch_timestamp.strftime("%d/%m/%Y %H:%M")
             total = sum(len(v) for v in st.session_state.fetched_news.values())
-            cats_done = len(st.session_state.fetched_news)
+            cats  = len(st.session_state.fetched_news)
+            chars = len(st.session_state.raw_news_text)
             st.markdown(f"""
             <div class="stats-row">
                 <div class="stat-box"><div class="stat-num">{total}</div><div class="stat-lbl">Articoli</div></div>
-                <div class="stat-box"><div class="stat-num">{cats_done}</div><div class="stat-lbl">Categorie</div></div>
-                <div class="stat-box"><div class="stat-num" style="font-size:1rem;padding-top:0.3rem">{ts}</div><div class="stat-lbl">Ultimo fetch</div></div>
+                <div class="stat-box"><div class="stat-num">{cats}</div><div class="stat-lbl">Categorie</div></div>
+                <div class="stat-box"><div class="stat-num" style="font-size:0.85rem;padding-top:0.4rem">{chars:,}</div><div class="stat-lbl">Caratteri</div></div>
+                <div class="stat-box"><div class="stat-num" style="font-size:0.85rem;padding-top:0.4rem">{ts}</div><div class="stat-lbl">Ultimo fetch</div></div>
             </div>
             """, unsafe_allow_html=True)
 
     # -------------------------------------------------------------------------
-    # AZIONE: Fetch notizie
+    # AZIONE: Fetch notizie con multi-query
     # -------------------------------------------------------------------------
     if fetch_clicked:
         if not st.session_state.newsapi_key:
@@ -729,50 +940,105 @@ with tab_main:
         elif not st.session_state.selected_cats:
             st.error("❌ Seleziona almeno una categoria di notizie nella sidebar.")
         else:
-            active_labels = [c["label"] for c in NEWS_CATEGORIES if c["id"] in st.session_state.selected_cats]
-            progress_bar = st.progress(0, text="Inizializzazione ricerca...")
-            n = len(active_labels)
-
-            fetched, errors = {}, []
-            from_date = (datetime.utcnow() - timedelta(days=st.session_state.news_days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
             active_cats = [c for c in NEWS_CATEGORIES if c["id"] in st.session_state.selected_cats]
-            for i, cat in enumerate(active_cats):
-                progress_bar.progress(
-                    int((i / n) * 100),
-                    text=f"Recupero {cat['label']} ({i+1}/{n})…"
-                )
-                try:
-                    articles = fetch_category(st.session_state.newsapi_key, cat, from_date)
-                    fetched[cat["id"]] = articles
-                    time.sleep(0.3)
-                except requests.exceptions.HTTPError as he:
-                    status = he.response.status_code if he.response is not None else "?"
-                    if status == 401:
-                        errors.append(f"{cat['label']}: NewsAPI Key non valida (401)")
-                        break  # chiave invalida: inutile continuare
-                    elif status == 429:
-                        errors.append(f"{cat['label']}: Rate limit raggiunto (429) — attendi qualche minuto")
-                    else:
-                        errors.append(f"{cat['label']}: Errore HTTP {status}")
-                except Exception as e:
-                    errors.append(f"{cat['label']}: {str(e)}")
+            total_queries = sum(len(c["queries"]) for c in active_cats)
+            progress_bar  = st.progress(0, text="Inizializzazione ricerca multi-query…")
+            from_date     = (datetime.utcnow() - timedelta(days=st.session_state.news_days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            fetched    = {}
+            errors     = []
+            all_debug  = [f"🗓️ From date: {from_date}", f"📊 Totale query pianificate: {total_queries}"]
+            query_done = 0
+            abort      = False
+
+            for cat in active_cats:
+                if abort:
+                    break
+                cat_arts  = []
+                seen_urls = set()
+                seen_ttls = set()
+
+                for qi, q in enumerate(cat["queries"], 1):
+                    progress_bar.progress(
+                        int((query_done / total_queries) * 100),
+                        text=f"{cat['label']} — query {qi}/{len(cat['queries'])}…"
+                    )
+                    try:
+                        arts, dbg = _execute_single_query(
+                            st.session_state.newsapi_key,
+                            q["endpoint"],
+                            q["params"],
+                            from_date,
+                        )
+                        all_debug.append(f"  {cat['label']} Q{qi}: {dbg}")
+
+                        for art in arts:
+                            url = art["url"]
+                            ttl = art["title"].lower()[:80]
+                            if url not in seen_urls and ttl not in seen_ttls:
+                                seen_urls.add(url)
+                                seen_ttls.add(ttl)
+                                cat_arts.append(art)
+
+                        time.sleep(0.25)
+
+                    except requests.exceptions.HTTPError as he:
+                        status = he.response.status_code if he.response is not None else "?"
+                        if status == 401:
+                            errors.append("❌ NewsAPI Key non valida (401). Controlla la chiave.")
+                            abort = True
+                            break
+                        elif status == 429:
+                            errors.append(f"⏳ Rate limit raggiunto (429) durante {cat['label']}. "
+                                          "Alcune query sono state saltate. Attendi qualche minuto.")
+                            break  # salta le query rimanenti di questa categoria
+                        else:
+                            all_debug.append(f"  {cat['label']} Q{qi}: HTTP {status}")
+                    except Exception as e:
+                        all_debug.append(f"  {cat['label']} Q{qi}: {str(e)[:100]}")
+
+                    query_done += 1
+
+                if cat_arts:
+                    fetched[cat["id"]] = sorted(
+                        cat_arts,
+                        key=lambda a: a.get("publishedAt", ""),
+                        reverse=True,
+                    )
+                    all_debug.append(f"  ✅ {cat['label']}: {len(cat_arts)} articoli unici")
+                else:
+                    fetched[cat["id"]] = []
+                    all_debug.append(f"  ⚠️ {cat['label']}: nessun articolo recuperato")
 
             progress_bar.progress(100, text="Completato!")
-            time.sleep(0.5)
+            time.sleep(0.4)
             progress_bar.empty()
 
             st.session_state.fetched_news    = fetched
             st.session_state.fetch_errors    = errors
+            st.session_state.fetch_debug     = all_debug
             st.session_state.fetch_timestamp = datetime.utcnow()
             st.session_state.raw_news_text   = format_news_for_llm(fetched) if fetched else ""
 
             total_art = sum(len(v) for v in fetched.values())
             if fetched:
                 st.success(f"✅ Recuperati **{total_art} articoli** in **{len(fetched)} categorie**.")
-            if errors:
-                for err in errors:
-                    st.warning(f"⚠️ {err}")
+            for err in errors:
+                st.warning(f"⚠️ {err}")
+
+            # Riepilogo per categoria
+            if total_art > 0:
+                cols = st.columns(len(fetched))
+                cat_map = {c["id"]: c["label"] for c in NEWS_CATEGORIES}
+                for i, (cid, arts) in enumerate(fetched.items()):
+                    with cols[i]:
+                        color = "#e8a838" if arts else "#e05c5c"
+                        st.markdown(
+                            f'<div style="text-align:center; font-size:0.75rem; color:{color};">'
+                            f'{cat_map.get(cid, cid)}<br>'
+                            f'<strong style="font-size:1.3rem">{len(arts)}</strong></div>',
+                            unsafe_allow_html=True
+                        )
             st.rerun()
 
     # -------------------------------------------------------------------------
@@ -791,7 +1057,7 @@ with tab_main:
             except ValueError as ve:
                 st.error(f"⚠️ {ve}")
             except requests.exceptions.Timeout:
-                st.error("⏱️ Timeout: il provider LLM non ha risposto in tempo. Riprova.")
+                st.error("⏱️ Timeout: il provider LLM non ha risposto in tempo. Riprova o usa un modello più veloce.")
             except requests.exceptions.HTTPError as he:
                 s = he.response.status_code if he.response is not None else "?"
                 msgs = {
@@ -828,7 +1094,6 @@ with tab_main:
             unsafe_allow_html=True,
         )
     else:
-        # Stato iniziale / guida
         st.markdown("""
         ### Come usare NewsAI
 
@@ -837,14 +1102,20 @@ with tab_main:
         - La **API Key** del provider LLM che vuoi usare (Google, OpenRouter o OpenAI)
 
         **Passo 2** — Configura la ricerca:
-        - Scegli quanti giorni di notizie recuperare (default: ultime 24h)
-        - Seleziona le categorie geografiche che ti interessano
+        - Scegli quanti giorni di notizie recuperare (default: ultime 48h)
+        - Seleziona le categorie geografiche di interesse
 
         **Passo 3** — Clicca **🔍 Cerca Notizie**
-        L'app interroga autonomamente NewsAPI per ogni categoria selezionata.
+        L'app esegue **3 query distinte per ogni categoria** e deduplica i risultati.
+        Piano free NewsAPI: 100 req/giorno → con 6 categorie consuma ~18 query.
 
         **Passo 4** — Clicca **🚀 Genera Report**
-        Le notizie vengono inviate all'LLM scelto, che produce un report strutturato in italiano con sezioni per Europa, USA, Asia, Medio Oriente, economia tedesca e mercati finanziari.
+        Le notizie vengono inviate all'LLM che produce un report strutturato in italiano.
+
+        ---
+        > 💡 **Suggerimento**: Abilita il **Debug mode** nella sidebar per vedere esattamente
+        > quanti articoli ha trovato ogni query, e usa il tab **🐛 Log Query** per diagnosticare
+        > categorie con pochi risultati.
         """)
 
 
@@ -865,9 +1136,14 @@ with tab_preview:
 
         for cat_id, articles in st.session_state.fetched_news.items():
             label = cat_map.get(cat_id, cat_id)
-            with st.expander(f"{label} — {len(articles)} articoli", expanded=False):
+            color = "normal" if articles else "off"
+            with st.expander(f"{label} — **{len(articles)} articoli**", expanded=False):
                 if not articles:
-                    st.caption("Nessun articolo recuperato.")
+                    st.warning(
+                        "Nessun articolo recuperato per questa categoria. "
+                        "Consulta il tab 🐛 Log Query per diagnosticare il problema.",
+                        icon="⚠️",
+                    )
                 else:
                     for art in articles:
                         pub = art["publishedAt"][:10] if art["publishedAt"] else ""
@@ -883,11 +1159,42 @@ with tab_preview:
         st.subheader("📄 Testo Grezzo inviato all'LLM")
         with st.expander("Visualizza testo completo", expanded=False):
             st.text(st.session_state.raw_news_text)
-        st.caption(f"Dimensione: {len(st.session_state.raw_news_text):,} caratteri")
+        st.caption(f"Dimensione: {len(st.session_state.raw_news_text):,} caratteri "
+                   f"(~{len(st.session_state.raw_news_text)//4:,} token stimati)")
 
 
 # ===========================================================================
-# TAB 3: ISTRUZIONI DI SISTEMA
+# TAB 3: LOG QUERY (DEBUG)
+# ===========================================================================
+
+with tab_debug:
+    st.subheader("🐛 Log Query NewsAPI")
+    st.caption(
+        "Questo tab mostra le query eseguite nell'ultimo fetch, il numero di articoli "
+        "per ogni sub-query e gli eventuali errori. Utile per diagnosticare categorie "
+        "che restituiscono pochi o nessun risultato."
+    )
+
+    if not st.session_state.fetch_debug:
+        st.info("Nessun log disponibile. Esegui prima **🔍 Cerca Notizie**.", icon="ℹ️")
+    else:
+        log_text = "\n".join(st.session_state.fetch_debug)
+        st.code(log_text, language="text")
+
+        st.divider()
+        st.subheader("📐 Struttura Query per Categoria")
+        st.caption("Query pianificate nel codice sorgente (indipendentemente dall'esecuzione).")
+
+        for cat in NEWS_CATEGORIES:
+            with st.expander(f"{cat['label']} — {len(cat['queries'])} query", expanded=False):
+                for i, q in enumerate(cat["queries"], 1):
+                    st.markdown(f"**Query {i}** — endpoint: `/{q['endpoint']}`")
+                    params_clean = {k: v for k, v in q["params"].items()}
+                    st.json(params_clean)
+
+
+# ===========================================================================
+# TAB 4: ISTRUZIONI DI SISTEMA
 # ===========================================================================
 
 with tab_system:
@@ -900,15 +1207,6 @@ with tab_system:
 
     with st.expander("📜 Visualizza System Prompt completo", expanded=True):
         st.markdown(SYSTEM_PROMPT)
-
-    st.divider()
-    st.subheader("🔍 Query NewsAPI per Categoria")
-
-    for cat in NEWS_CATEGORIES:
-        with st.expander(f"{cat['label']}", expanded=False):
-            st.markdown(f"**Endpoint:** `/v2/{cat['endpoint']}`")
-            params_display = {k: v for k, v in cat["params"].items()}
-            st.json(params_display)
 
     st.divider()
     st.subheader("📦 Dipendenze Python")
