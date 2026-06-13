@@ -1,0 +1,9 @@
+# NewsAI - Dipendenze Python
+# Installa con: pip install -r requirements.txt
+
+streamlit>=1.35.0
+requests>=2.31.0
+
+# Provider opzionali (l'app usa HTTP diretto come fallback se non installati)
+openai>=1.30.0
+google-generativeai>=0.7.0
